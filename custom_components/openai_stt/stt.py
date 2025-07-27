@@ -173,66 +173,131 @@ class OpenAISTTProvider(Provider):
     async def async_process_audio_stream(
         self, metadata: SpeechMetadata, stream: AsyncIterable[bytes]
     ) -> SpeechResult:
+        """Process audio stream in real-time chunks."""
         _LOGGER.debug(
-            "Start processing audio stream for language: %s", metadata.language
+            "Start streaming audio processing for language: %s", metadata.language
         )
-
-        # Collect data
-        audio_data = b""
-        async for chunk in stream:
-            audio_data += chunk
-
-        _LOGGER.debug("Audio data size: %d bytes", len(audio_data))
-
-        # Convert audio data to the correct format
-        wav_stream = io.BytesIO()
-
-        with wave.open(wav_stream, "wb") as wf:
-            wf.setnchannels(metadata.channel)
-            wf.setsampwidth(metadata.bit_rate // 8)
-            wf.setframerate(metadata.sample_rate)
-            wf.writeframes(audio_data)
-
+    
         headers = {
             "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
         }
-
-        files = {
-            "file": ("whisper_audio.wav", wav_stream.getvalue(), "audio/wav"),
-            "model": (None, self._model),
-            "language": (None, metadata.language),
-            "prompt": (None, self._prompt),
-            "temperature": (None, str(self._temperature)),
-            "response_format": (None, "json"),
+    
+        # Initialize streaming session with your backend
+        session_data = {
+            "model": self._model,
+            "language": metadata.language,
+            "prompt": self._prompt,
+            "temperature": self._temperature,
+            "response_format": "json",
+            "stream": True,  # Enable streaming mode
+            "sample_rate": metadata.sample_rate,
+            "channels": metadata.channel,
+            "bit_rate": metadata.bit_rate
         }
-
-        url = f"{self._api_url}/audio/transcriptions"
-
-        _LOGGER.debug("Sending request to API: %s", url)
-
+    
         try:
-            # Send the request to the API
-            response = await self._client.post(
-                url,
+            # Start streaming session
+            session_url = f"{self._api_url}/audio/transcriptions/stream"
+            
+            # Initialize the streaming session
+            init_response = await self._client.post(
+                session_url,
                 headers=headers,
-                files=files,
-                timeout=httpx.Timeout(10.0),
+                json=session_data,
+                timeout=httpx.Timeout(30.0)
             )
-            response.raise_for_status()
-            result = response.json()
-            _LOGGER.debug("API response: %s", result)
+            init_response.raise_for_status()
+            session_info = init_response.json()
+            session_id = session_info.get("session_id")
+            
+            if not session_id:
+                _LOGGER.error("Failed to initialize streaming session")
+                return SpeechResult("", SpeechResultState.ERROR)
+    
+            _LOGGER.debug("Streaming session initialized: %s", session_id)
+    
+            # Stream audio chunks in real-time
+            chunk_url = f"{self._api_url}/audio/transcriptions/stream/{session_id}/chunk"
+            final_transcription = ""
+            
+            async for chunk in stream:
+                if not chunk:
+                    continue
+                    
+                _LOGGER.debug("Sending audio chunk: %d bytes", len(chunk))
+                
+                # Convert raw audio chunk to WAV format
+                wav_chunk = self._convert_chunk_to_wav(chunk, metadata)
+                
+                # Send chunk to streaming endpoint
+                files = {
+                    "audio_chunk": ("chunk.wav", wav_chunk, "audio/wav"),
+                    "session_id": (None, session_id)
+                }
+                
+                chunk_response = await self._client.post(
+                    chunk_url,
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    files=files,
+                    timeout=httpx.Timeout(5.0)
+                )
+                
+                if chunk_response.status_code == 200:
+                    chunk_result = chunk_response.json()
+                    partial_text = chunk_result.get("partial_text", "")
+                    is_final = chunk_result.get("is_final", False)
+                    
+                    if partial_text:
+                        _LOGGER.debug("Partial transcription: %s", partial_text)
+                        if is_final:
+                            final_transcription += partial_text + " "
+                else:
+                    _LOGGER.warning("Chunk processing failed: %s", chunk_response.status_code)
+    
+            # Finalize the streaming session
+            finalize_url = f"{self._api_url}/audio/transcriptions/stream/{session_id}/finalize"
+            final_response = await self._client.post(
+                finalize_url,
+                headers=headers,
+                timeout=httpx.Timeout(10.0)
+            )
+            
+            if final_response.status_code == 200:
+                final_result = final_response.json()
+                final_text = final_result.get("final_text", final_transcription.strip())
+                _LOGGER.debug("Final transcription: %s", final_text)
+                return SpeechResult(final_text, SpeechResultState.SUCCESS)
+            else:
+                _LOGGER.warning("Failed to finalize session, using accumulated text")
+                return SpeechResult(final_transcription.strip(), SpeechResultState.SUCCESS)
+    
         except httpx.HTTPError as err:
             if hasattr(err, "response") and err.response:
+                try:
+                    error_detail = err.response.json()["error"]["message"]
+                except:
+                    error_detail = str(err.response.content)
                 _LOGGER.error(
                     "HTTP error %s: %s",
                     err.response.status_code,
-                    err.response.json()["error"]["message"],
+                    error_detail,
                 )
             else:
                 _LOGGER.error("HTTP error: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
         except Exception as err:
-            _LOGGER.error("Error: %s", err)
+            _LOGGER.error("Streaming error: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
-
-        return SpeechResult(result["text"], SpeechResultState.SUCCESS)
+    
+    def _convert_chunk_to_wav(self, chunk_data: bytes, metadata: SpeechMetadata) -> bytes:
+        """Convert raw audio chunk to WAV format."""
+        wav_stream = io.BytesIO()
+        
+        with wave.open(wav_stream, "wb") as wf:
+            wf.setnchannels(metadata.channel)
+            wf.setsampwidth(metadata.bit_rate // 8)
+            wf.setframerate(metadata.sample_rate)
+            wf.writeframes(chunk_data)
+        
+        return wav_stream.getvalue()

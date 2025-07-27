@@ -186,7 +186,7 @@ class OpenAISTTProvider(Provider):
         # Initialize streaming session with your backend
         session_data = {
             "model": self._model,
-            "language": metadata.language,
+            "language": "hu-HU" if metadata.language == "hu" else metadata.language,  # FIX: Ensure proper language format
             "prompt": self._prompt,
             "temperature": self._temperature,
             "response_format": "json",
@@ -196,9 +196,13 @@ class OpenAISTTProvider(Provider):
             "bit_rate": metadata.bit_rate
         }
     
+        session_id = None  # Initialize session_id
+        
         try:
             # Start streaming session
             session_url = f"{self._api_url}/audio/transcriptions/stream"
+            
+            _LOGGER.debug("Initializing streaming session with data: %s", session_data)
             
             # Initialize the streaming session
             init_response = await self._client.post(
@@ -212,20 +216,21 @@ class OpenAISTTProvider(Provider):
             session_id = session_info.get("session_id")
             
             if not session_id:
-                _LOGGER.error("Failed to initialize streaming session")
+                _LOGGER.error("Failed to initialize streaming session - no session_id received")
                 return SpeechResult("", SpeechResultState.ERROR)
     
-            _LOGGER.debug("Streaming session initialized: %s", session_id)
+            _LOGGER.info("Streaming session initialized: %s", session_id)
     
             # Stream audio chunks in real-time
             chunk_url = f"{self._api_url}/audio/transcriptions/stream/{session_id}/chunk"
-            final_transcription = ""
+            chunk_count = 0
             
             async for chunk in stream:
                 if not chunk:
                     continue
                     
-                _LOGGER.debug("Sending audio chunk: %d bytes", len(chunk))
+                chunk_count += 1
+                _LOGGER.debug("Sending audio chunk #%d: %d bytes", chunk_count, len(chunk))
                 
                 # Convert raw audio chunk to WAV format
                 wav_chunk = self._convert_chunk_to_wav(chunk, metadata)
@@ -233,14 +238,14 @@ class OpenAISTTProvider(Provider):
                 # Send chunk to streaming endpoint
                 files = {
                     "audio_chunk": ("chunk.wav", wav_chunk, "audio/wav"),
-                    "session_id": (None, session_id)
                 }
                 
+                # FIX: Remove session_id from files, it's in the URL
                 chunk_response = await self._client.post(
                     chunk_url,
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     files=files,
-                    timeout=httpx.Timeout(5.0)
+                    timeout=httpx.Timeout(10.0)  # Increased timeout
                 )
                 
                 if chunk_response.status_code == 200:
@@ -249,55 +254,100 @@ class OpenAISTTProvider(Provider):
                     is_final = chunk_result.get("is_final", False)
                     
                     if partial_text:
-                        _LOGGER.debug("Partial transcription: %s", partial_text)
-                        if is_final:
-                            final_transcription += partial_text + " "
+                        _LOGGER.debug("Partial transcription: %s (final: %s)", partial_text, is_final)
                 else:
-                    _LOGGER.warning("Chunk processing failed: %s", chunk_response.status_code)
+                    _LOGGER.warning("Chunk processing failed with status %s: %s", 
+                                  chunk_response.status_code, chunk_response.text)
     
-            # Finalize the streaming session
+            _LOGGER.info("Finished sending %d audio chunks, finalizing session %s", chunk_count, session_id)
+    
+            # FIX: Critical - Finalize the streaming session and handle response properly
             finalize_url = f"{self._api_url}/audio/transcriptions/stream/{session_id}/finalize"
             final_response = await self._client.post(
                 finalize_url,
-                headers=headers,
-                timeout=httpx.Timeout(10.0)
+                headers={"Authorization": f"Bearer {self._api_key}"},  # FIX: Use proper headers
+                timeout=httpx.Timeout(20.0)  # Increased timeout for processing
             )
+            
+            _LOGGER.debug("Finalize response status: %s", final_response.status_code)
             
             if final_response.status_code == 200:
                 final_result = final_response.json()
-                final_text = final_result.get("final_text", final_transcription.strip())
-                _LOGGER.debug("Final transcription: %s", final_text)
-                return SpeechResult(final_text, SpeechResultState.SUCCESS)
-            else:
-                _LOGGER.warning("Failed to finalize session, using accumulated text")
-                return SpeechResult(final_transcription.strip(), SpeechResultState.SUCCESS)
-    
-        except httpx.HTTPError as err:
-            if hasattr(err, "response") and err.response:
+                final_text = final_result.get("text", "")  # FIX: Server returns "text", not "final_text"
+                
+                _LOGGER.info("Final transcription received: '%s'", final_text)
+                
+                # FIX: Check if final_text is empty or None
+                if not final_text or final_text.strip() == "":
+                    _LOGGER.error("Empty final transcription received from server")
+                    return SpeechResult("", SpeechResultState.ERROR)
+                
+                return SpeechResult(final_text.strip(), SpeechResultState.SUCCESS)
+            
+            elif final_response.status_code == 400:
+                # Handle "No speech detected" error
+                error_msg = "No speech detected or transcription failed"
                 try:
-                    error_detail = err.response.json()["error"]["message"]
+                    error_detail = final_response.json().get("error", error_msg)
+                    _LOGGER.warning("Transcription failed: %s", error_detail)
                 except:
-                    error_detail = str(err.response.content)
-                _LOGGER.error(
-                    "HTTP error %s: %s",
-                    err.response.status_code,
-                    error_detail,
-                )
+                    _LOGGER.warning("Transcription failed with 400 error")
+                return SpeechResult("", SpeechResultState.ERROR)
+            
+            elif final_response.status_code == 408:
+                # Handle timeout error
+                _LOGGER.error("Speech recognition timed out")
+                return SpeechResult("", SpeechResultState.ERROR)
+            
             else:
-                _LOGGER.error("HTTP error: %s", err)
+                _LOGGER.error("Failed to finalize session with status %s: %s", 
+                            final_response.status_code, final_response.text)
+                return SpeechResult("", SpeechResultState.ERROR)
+    
+        except httpx.TimeoutException as err:
+            _LOGGER.error("Request timeout during streaming: %s", err)
+            return SpeechResult("", SpeechResultState.ERROR)
+        except httpx.HTTPStatusError as err:
+            _LOGGER.error("HTTP status error: %s - %s", err.response.status_code, err.response.text)
+            return SpeechResult("", SpeechResultState.ERROR)
+        except httpx.HTTPError as err:
+            _LOGGER.error("HTTP error during streaming: %s", err)
             return SpeechResult("", SpeechResultState.ERROR)
         except Exception as err:
-            _LOGGER.error("Streaming error: %s", err)
+            _LOGGER.error("Unexpected error during streaming: %s", err, exc_info=True)
             return SpeechResult("", SpeechResultState.ERROR)
+        
+        finally:
+            # FIX: Cleanup - if session was created but not properly finalized
+            if session_id and hasattr(self, '_cleanup_needed'):
+                try:
+                    cleanup_url = f"{self._api_url}/audio/transcriptions/stream/{session_id}/cleanup"
+                    await self._client.delete(cleanup_url, timeout=httpx.Timeout(5.0))
+                except:
+                    pass  # Ignore cleanup errors
     
     def _convert_chunk_to_wav(self, chunk_data: bytes, metadata: SpeechMetadata) -> bytes:
         """Convert raw audio chunk to WAV format."""
-        wav_stream = io.BytesIO()
-        
-        with wave.open(wav_stream, "wb") as wf:
-            wf.setnchannels(metadata.channel)
-            wf.setsampwidth(metadata.bit_rate // 8)
-            wf.setframerate(metadata.sample_rate)
-            wf.writeframes(chunk_data)
-        
-        return wav_stream.getvalue()
+        try:
+            wav_stream = io.BytesIO()
+            
+            with wave.open(wav_stream, "wb") as wf:
+                wf.setnchannels(metadata.channel)
+                wf.setsampwidth(metadata.bit_rate // 8)
+                wf.setframerate(metadata.sample_rate)
+                wf.writeframes(chunk_data)
+            
+            wav_data = wav_stream.getvalue()
+            _LOGGER.debug("Converted %d bytes of raw audio to %d bytes WAV", len(chunk_data), len(wav_data))
+            return wav_data
+            
+        except Exception as e:
+            _LOGGER.error("Error converting chunk to WAV: %s", e)
+            # Return empty WAV header as fallback
+            wav_stream = io.BytesIO()
+            with wave.open(wav_stream, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"")
+            return wav_stream.getvalue()
